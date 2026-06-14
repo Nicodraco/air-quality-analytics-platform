@@ -1,0 +1,27 @@
+# Data manipulation
+pandas>=2.0.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+
+# API requests
+requests>=2.31.0
+httpx>=0.27.0
+
+# Web scraping / data download
+wget>=3.2
+
+# Machine Learning
+scikit-learn>=1.3.0
+statsmodels>=0.14.0
+
+# Dashboard
+streamlit>=1.28.0
+folium>=0.16.0
+streamlit-folium>=0.15.0
+plotly>=5.18.0
+
+# LLM
+openai>=1.0.0
+
+# Utils
+schedule>=1.2.0
