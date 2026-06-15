@@ -1,152 +1,158 @@
-# 🌍 Monitor de Calidad del Aire y Datos Ambientales
+# Plataforma Inteligente de Monitoreo Ambiental
 
-**Grupo 6** - Gestión de la Información - I Semestre 2026
+**Grupo 6** - Gestión de la Información - I Semestre 2026  
 Universidad Tecnológica de Panamá
 
-## 📋 Descripción
+Plataforma de análisis ambiental con arquitectura **Medallion**, **Data Warehouse** (Modelo Estrella), integración **AEMET + MITECO**, predicciones ML, alertas OMS y resúmenes con LLM.
 
-Sistema de monitoreo de calidad del aire que integra datos del **Barcelona Supercomputing Center (BSC-CNS)** asociado a la **Universitat Politècnica de Catalunya (UPC)** de España, junto con APIs públicas de calidad del aire. Aplica Machine Learning para predicción de tendencias y clustering de estaciones, con un dashboard interactivo en Streamlit.
+Documento de requisitos: [`docs/PRD.md`](docs/PRD.md)
 
-## 🏛️ Fuente Principal: BSC / Universitat Politècnica de Catalunya (España)
+---
 
-Los datos provienen del **Barcelona Supercomputing Center - Centro Nacional de Supercomputación (BSC-CNS)**, centro de I+D asociado a la **Universitat Politècnica de Catalunya (UPC)**.
+## Arquitectura
 
-- **Dataset:** Street- and census-level NO₂ data for Barcelona with uncertainty
-- **Publicado en:** Nature Scientific Data (2026) - DOI: [10.1038/s41597-026-06592-x](https://www.nature.com/articles/s41597-026-06592-x)
-- **Datos:** 6 años (2019-2024) de NO₂ diario a nivel de calle (25m x 25m) y censal
-- **Plataforma:** [uncertAIR](https://earth.bsc.es/shiny/uncertAIR/)
-- **Zenodo:** [10.5281/zenodo.16737066](https://doi.org/10.5281/zenodo.16737066)
+```
+AEMET + MITECO → Bronze (MinIO/JSON) → Silver (Parquet) → Gold (PostgreSQL)
+                                                              ↓
+                                    Dashboard | ML | Alertas | LLM
+```
 
-### Fuentes adicionales
-
-| Fuente | Descripción | API Key |
+| Capa | Formato | Ubicación |
 |---|---|---|
-| [Open-Meteo](https://open-meteo.com/en/docs/air-quality-api) | CAMS/Copernicus - PM2.5, PM10, NO₂, O₃, SO₂, CO, AQI | No requiere |
-| [OpenAQ](https://docs.openaq.org) | Estaciones de monitoreo globales (incluye España) | Gratuita |
+| Bronze | JSON | MinIO `bronze/aemet/`, `bronze/miteco/` |
+| Silver | Parquet | `data/silver/` |
+| Gold | SQL | PostgreSQL (Modelo Estrella) |
 
-## 🚀 Requisitos
+---
+
+## Requisitos
 
 - Python 3.10+
-- pip
+- Docker + Docker Compose (MinIO + PostgreSQL)
+- API Key AEMET ([opendata.aemet.es](https://opendata.aemet.es))
 
-## 📦 Instalación
+---
+
+## Instalación
 
 ```bash
-# Clonar el repositorio
-git clone <url-del-repo>
-cd parcial2-grupo6
+cd Parcial2_TopicosEspeciales
 
-# Instalar dependencias
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 
-# Configurar variables de entorno (opcional)
-cp .env.example .env
-# Editar .env con tus API keys si es necesario
+# Infraestructura (MinIO + PostgreSQL)
+docker compose up -d
+
+# Variables de entorno (usa tu .env con API_KEY_AEMET)
+cp .env.example .env   # solo si aún no tienes .env
 ```
 
-## 🔄 Pipeline de Datos
+### Variables `.env` principales
 
-```mermaid
-graph LR
-    A[BSC/UPC - NO₂ Barcelona] --> D[Pipeline]
-    B[Open-Meteo API] --> D
-    C[OpenAQ API] --> D
-    D --> E[Preprocesamiento]
-    E --> F[ML - Predicción]
-    E --> G[ML - Clustering]
-    E --> H[Dashboard Streamlit]
-    E --> I[Resúmenes LLM]
+```env
+API_KEY_AEMET=tu_clave_aemet
+URL_BUSQUEDA_MITECO=https://miteco.gob.es
+URL_DATASTORE_MITECO=https://datos.gob.es/apidata/catalog/dataset
+LLM_API_KEY=tu_clave_opcional
 ```
 
-### 1. Ingesta de datos
+---
+
+## Ejecución
+
+### Pipeline completo (ETL Medallion)
 
 ```bash
-# Fuente 1: Datos BSC/UPC (Barcelona NO₂ 2019-2024)
-python src/pipeline/ingest_bsc.py
-
-# Fuente 2: Open-Meteo Air Quality API
-python src/pipeline/ingest_openmeteo.py
-
-# Fuente 3: OpenAQ API (opcional)
-python src/pipeline/ingest_openaq.py
+python src/pipeline/run_pipeline.py
 ```
 
-### 2. Preprocesamiento
+Pasos: Ingesta AEMET/MITECO → Bronze → Silver → Gold → ML → Alertas → Resumen LLM
+
+### Pipeline automatizado (cada hora)
 
 ```bash
-python src/pipeline/preprocess.py
+python src/pipeline/scheduler.py
 ```
 
-### 3. Machine Learning
-
-```bash
-# Predicción de tendencias (Random Forest)
-python src/ml/predict.py
-
-# Clustering de estaciones (K-Means)
-python src/ml/cluster.py
-```
-
-### 4. Dashboard
+### Dashboard Streamlit
 
 ```bash
 streamlit run src/dashboard/app.py
 ```
 
-### 5. Resúmenes con IA
+### Componentes individuales
 
 ```bash
+python src/ingestion/aemet.py
+python src/ingestion/miteco.py
+python src/silver/transform.py
+python src/gold/loader.py
+python src/ml/predict.py
+python src/ml/alerts.py
 python src/llm/summaries.py
 ```
 
-## 📊 Dashboard
+---
 
-El dashboard incluye:
+## Modelo Estrella (Gold)
 
-- **📊 Visión General** - KPIs y estadísticas principales
-- **🗺️ Mapas Interactivos** - Estaciones de monitoreo en Folium + mapas de calor
-- **📈 Tendencias** - Series temporales y correlaciones
-- **🤖 Predicciones ML** - Random Forest con métricas y pronóstico
-- **📄 Resúmenes IA** - Reportes generados por LLM
-- **ℹ️ Acerca del Proyecto** - Documentación y referencias
+| Tabla | Descripción |
+|---|---|
+| `fact_environmental_measures` | Hechos: clima + contaminantes |
+| `dim_date` | Dimensión temporal |
+| `dim_station` | Estaciones AEMET/MITECO |
+| `dim_location` | Geografía (región, municipio, coords) |
+| `dim_pollutant` | Contaminantes y límites legales |
 
-## 📁 Estructura del Proyecto
+---
+
+## Estructura del proyecto
 
 ```
-parcial2-grupo6/
-├── README.md
-├── requirements.txt
-├── .env.example
+├── docs/PRD.md
+├── docker-compose.yml
 ├── data/
-│   ├── raw/            # Datos crudos de APIs
-│   ├── processed/      # Datos limpios y transformados
-│   └── external/       # Datos BSC/Zenodo
-├── src/
-│   ├── pipeline/       # Módulos de ingesta y preprocesamiento
-│   │   ├── ingest_bsc.py        # Ingesta BSC/UPC
-│   │   ├── ingest_openmeteo.py  # Ingesta Open-Meteo
-│   │   ├── ingest_openaq.py     # Ingesta OpenAQ
-│   │   └── preprocess.py        # Preprocesamiento
-│   ├── ml/             # Modelos de ML
-│   │   ├── predict.py           # Random Forest (regresión)
-│   │   └── cluster.py           # K-Means (clustering)
-│   ├── dashboard/      # Dashboard Streamlit
-│   │   └── app.py               # Aplicación principal
-│   ├── llm/            # Resúmenes con IA
-│   │   └── summaries.py         # Generación de reportes
-│   └── utils/          # Utilidades
-│       └── maps.py              # Mapas Folium
-├── models/             # Modelos entrenados
-├── reports/            # Reportes generados
-├── docs/               # Documentación adicional
-└── notebooks/          # Notebooks exploratorios
+│   ├── bronze/          # Fallback local JSON
+│   └── silver/          # Parquet normalizado
+├── reports/             # Alertas + resúmenes IA
+├── models/              # Modelos ML
+└── src/
+    ├── config.py
+    ├── ingestion/       # AEMET, MITECO
+    ├── bronze/          # MinIO storage
+    ├── silver/          # Transformaciones
+    ├── gold/            # PostgreSQL DW
+    ├── pipeline/        # ETL + scheduler
+    ├── ml/              # Predicción + alertas
+    ├── llm/             # Resúmenes diarios
+    ├── dashboard/       # Streamlit
+    └── utils/           # Mapas Folium
 ```
 
-## ✅ Evaluación
+---
 
-| Componente | Peso | Estado |
+## Servicios Docker
+
+| Servicio | Puerto | Credenciales |
 |---|---|---|
-| Pipeline de datos | 30% | ✅ |
-| Análisis ML | 25% | ✅ |
-| Visualización/Dashboard | 25% | ✅ |
-| Documentación | 20% | ✅ |
+| MinIO API | 9000 | minioadmin / minioadmin123 |
+| MinIO Console | 9001 | minioadmin / minioadmin123 |
+| PostgreSQL | 5432 | ambiental / ambiental123 |
+
+---
+
+## Entregables PRD
+
+- [x] Arquitectura Medallion
+- [x] Data Lake (MinIO + Parquet)
+- [x] Data Warehouse PostgreSQL
+- [x] Modelo Estrella
+- [x] ETL automatizado
+- [x] Dashboard + Folium
+- [x] Predicciones ML (Random Forest)
+- [x] Alertas OMS
+- [x] Resúmenes LLM
+- [x] Docker Compose
+- [x] Documentación técnica

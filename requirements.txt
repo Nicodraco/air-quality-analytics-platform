@@ -1,18 +1,22 @@
 # Data manipulation
 pandas>=2.0.0
 numpy>=1.24.0
+pyarrow>=14.0.0
 python-dotenv>=1.0.0
 
 # API requests
 requests>=2.31.0
 httpx>=0.27.0
 
-# Web scraping / data download
-wget>=3.2
+# Bronze - MinIO
+minio>=7.2.0
+
+# Gold - PostgreSQL
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
 
 # Machine Learning
 scikit-learn>=1.3.0
-statsmodels>=0.14.0
 
 # Dashboard
 streamlit>=1.28.0
@@ -23,5 +27,12 @@ plotly>=5.18.0
 # LLM
 openai>=1.0.0
 
-# Utils
+# Pipeline scheduler
 schedule>=1.2.0
+
+# Utils
+joblib>=1.3.0
+
+# Entorno
+python-dotenv
+ollama

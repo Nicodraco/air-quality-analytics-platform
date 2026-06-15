@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+venv/
+
+# Environment variables
+.env
+
+# Airflow
+airflow.db
+logs/
+
+# VSCode
+.vscode/
+
+# Mac/Linux
+.DS_Store

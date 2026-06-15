@@ -1,0 +1,1 @@
+"""Capa Bronze - almacenamiento crudo."""

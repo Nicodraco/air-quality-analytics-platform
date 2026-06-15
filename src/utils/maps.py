@@ -1,207 +1,146 @@
 """
-Utilidades de mapas con Folium para visualización de estaciones
-de calidad del aire y datos ambientales.
+Mapas Folium para la plataforma de monitoreo ambiental.
+
+Capas: estaciones meteorológicas, calidad del aire, heatmaps, alertas.
+Colores: Verde = Bueno, Amarillo = Moderado, Rojo = Crítico
 """
+
+import json
+from pathlib import Path
 
 import folium
 import pandas as pd
-import numpy as np
-from folium.plugins import HeatMap, MarkerCluster
+from folium.plugins import HeatMap
+
+from src.config import REPORTS_DIR, WHO_LIMITS
 
 
-AIR_QUALITY_COLORS = {
-    "good": "green",
-    "fair": "yellow",
-    "moderate": "orange",
-    "poor": "red",
-    "very_poor": "purple",
-    "extremely_poor": "maroon",
-}
-
-
-def get_aqi_color(value):
-    """Asigna color según el European AQI."""
+def aqi_color(value: float | None) -> str:
     if value is None or pd.isna(value):
         return "gray"
-    if value <= 20:
+    if value <= 25:
         return "green"
-    elif value <= 40:
+    if value <= 50:
         return "yellow"
-    elif value <= 60:
+    if value <= 75:
         return "orange"
-    elif value <= 80:
-        return "red"
-    elif value <= 100:
-        return "purple"
-    else:
-        return "maroon"
+    return "red"
 
 
-def get_aqi_category(value):
-    """Categoría textual del AQI."""
+def aqi_label(value: float | None) -> str:
     if value is None or pd.isna(value):
         return "Sin datos"
-    if value <= 20:
-        return "Buena"
-    elif value <= 40:
-        return "Razonable"
-    elif value <= 60:
-        return "Moderada"
-    elif value <= 80:
-        return "Mala"
-    elif value <= 100:
-        return "Muy mala"
-    else:
-        return "Extremadamente mala"
+    if value <= 25:
+        return "Bueno"
+    if value <= 50:
+        return "Moderado"
+    return "Crítico"
 
 
 def create_station_map(
-    stations,
-    center_lat=41.3874,
-    center_lon=2.1686,
-    zoom_start=12,
-):
-    """
-    Crea mapa con estaciones de monitoreo.
+    stations_df: pd.DataFrame,
+    center_lat: float = 40.4,
+    center_lon: float = -3.7,
+    zoom: int = 6,
+    value_col: str = "aqi_index",
+) -> folium.Map:
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom, tiles="OpenStreetMap")
 
-    Args:
-        stations: Lista de dicts con lat, lon, name, aqi_value
-        center_lat, center_lon: Centro del mapa
-        zoom_start: Nivel de zoom inicial
-
-    Returns: folium.Map
-    """
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start)
-
-    for station in stations:
-        popup_html = f"""
-        <div style="font-family: sans-serif; min-width: 200px;">
-            <h4>{station.get('name', 'Estación')}</h4>
-            <b>AQI:</b> {station.get('aqi_value', 'N/A')}
-            <br><b>Categoría:</b> {station.get('aqi_category', 'N/A')}
-            <br><b>PM2.5:</b> {station.get('pm25', 'N/A')} µg/m³
-            <br><b>PM10:</b> {station.get('pm10', 'N/A')} µg/m³
-            <br><b>NO₂:</b> {station.get('no2', 'N/A')} µg/m³
-            <br><b>O₃:</b> {station.get('o3', 'N/A')} µg/m³
-        </div>
-        """
-
-        color = station.get("color", get_aqi_color(station.get("aqi_value")))
-
+    for _, row in stations_df.iterrows():
+        val = row.get(value_col)
+        color = aqi_color(val)
+        popup = folium.Popup(
+            f"""
+            <b>{row.get('station_name', 'Estación')}</b><br>
+            Tipo: {row.get('station_type', 'N/A')}<br>
+            Región: {row.get('region', 'N/A')}<br>
+            Municipio: {row.get('municipality', 'N/A')}<br>
+            AQI: {val if pd.notna(val) else 'N/A'} ({aqi_label(val)})<br>
+            PM2.5: {row.get('pm25', 'N/A')} | NO2: {row.get('no2', 'N/A')}<br>
+            Temp: {row.get('temperature', 'N/A')} °C
+            """,
+            max_width=280,
+        )
         folium.CircleMarker(
-            location=[station["lat"], station["lon"]],
-            radius=10,
-            popup=folium.Popup(popup_html, max_width=300),
+            location=[row["latitude"], row["longitude"]],
+            radius=9,
             color=color,
             fill=True,
             fill_color=color,
-            fill_opacity=0.7,
-            weight=2,
+            fill_opacity=0.75,
+            popup=popup,
         ).add_to(m)
 
     return m
 
 
-def create_heatmap(
-    data_points,
-    center_lat=41.3874,
-    center_lon=2.1686,
-    zoom_start=11,
-    radius=15,
-    blur=10,
-):
-    """
-    Crea mapa de calor con datos de contaminación.
+def create_heatmap(df: pd.DataFrame, value_col: str = "aqi_index") -> folium.Map:
+    center_lat = df["latitude"].mean() if not df.empty else 40.4
+    center_lon = df["longitude"].mean() if not df.empty else -3.7
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=6)
 
-    Args:
-        data_points: Lista de [lat, lon, intensity]
-        center_lat, center_lon: Centro del mapa
-        zoom_start: Nivel de zoom
-        radius, blur: Parámetros del heatmap
+    heat_data = []
+    for _, row in df.dropna(subset=["latitude", "longitude", value_col]).iterrows():
+        intensity = min(1.0, float(row[value_col]) / 100)
+        heat_data.append([row["latitude"], row["longitude"], intensity])
 
-    Returns: folium.Map
-    """
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start)
-
-    heat_data = [[p[0], p[1], p[2]] for p in data_points if not any(pd.isna(x) for x in p)]
-
-    HeatMap(
-        heat_data,
-        radius=radius,
-        blur=blur,
-        max_zoom=1,
-        gradient={
-            0.4: "blue",
-            0.6: "lime",
-            0.8: "orange",
-            1.0: "red",
-        },
-    ).add_to(m)
+    if heat_data:
+        HeatMap(
+            heat_data,
+            radius=18,
+            blur=12,
+            gradient={0.2: "green", 0.5: "yellow", 0.8: "orange", 1.0: "red"},
+        ).add_to(m)
 
     return m
 
 
-def create_barcelona_map():
-    """
-    Crea mapa interactivo de la red de monitoreo de Barcelona
-    con las estaciones del BSC/Ayuntamiento.
-    """
-    stations = [
-        {"name": "Eixample", "lat": 41.389, "lon": 2.165,
-         "aqi_value": 35, "pm25": 12, "pm10": 25, "no2": 42, "o3": 55},
-        {"name": "Gràcia - S. Gervasi", "lat": 41.402, "lon": 2.157,
-         "aqi_value": 30, "pm25": 10, "pm10": 22, "no2": 38, "o3": 60},
-        {"name": "Parc de la Ciutadella", "lat": 41.387, "lon": 2.188,
-         "aqi_value": 25, "pm25": 8, "pm10": 18, "no2": 30, "o3": 65},
-        {"name": "Palau Reial", "lat": 41.387, "lon": 2.117,
-         "aqi_value": 40, "pm25": 14, "pm10": 28, "no2": 48, "o3": 50},
-        {"name": "Poblenou", "lat": 41.407, "lon": 2.204,
-         "aqi_value": 38, "pm25": 13, "pm10": 26, "no2": 45, "o3": 52},
-        {"name": "Sants", "lat": 41.375, "lon": 2.136,
-         "aqi_value": 42, "pm25": 15, "pm10": 30, "no2": 50, "o3": 48},
-        {"name": "Vall d'Hebron", "lat": 41.427, "lon": 2.142,
-         "aqi_value": 22, "pm25": 7, "pm10": 16, "no2": 25, "o3": 68},
-        {"name": "Zona Universitària (UPC)", "lat": 41.386, "lon": 2.113,
-         "aqi_value": 28, "pm25": 9, "pm10": 20, "no2": 32, "o3": 62},
-    ]
+def create_alerts_map(alerts: list[dict]) -> folium.Map:
+    m = folium.Map(location=[40.4, -3.7], zoom_start=6)
+    for alert in alerts:
+        lat = alert.get("latitude")
+        lon = alert.get("longitude")
+        if lat is None or lon is None:
+            continue
+        color = "red" if alert.get("severity") == "critical" else "orange"
+        folium.Marker(
+            location=[lat, lon],
+            icon=folium.Icon(color="red" if color == "red" else "orange", icon="warning-sign"),
+            popup=(
+                f"{alert.get('station')}<br>"
+                f"{alert.get('pollutant')}: {alert.get('value')} "
+                f"(límite {alert.get('limit')})"
+            ),
+        ).add_to(m)
+    return m
 
-    for s in stations:
-        s["color"] = get_aqi_color(s["aqi_value"])
-        s["aqi_category"] = get_aqi_category(s["aqi_value"])
 
-    return create_station_map(
-        stations,
-        center_lat=41.395,
-        center_lon=2.160,
-        zoom_start=13,
+def load_latest_alerts() -> list[dict]:
+    path = REPORTS_DIR / "alerts_latest.json"
+    if not path.exists():
+        files = sorted(REPORTS_DIR.glob("alerts_*.json"))
+        if not files:
+            return []
+        path = files[-1]
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data.get("alerts", [])
+
+
+def build_station_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    agg = {}
+    for col in ["aqi_index", "pm25", "pm10", "no2", "temperature", "humidity"]:
+        if col in df.columns:
+            agg[col] = "mean"
+
+    summary = (
+        df.groupby(
+            ["station_id", "station_name", "station_type", "region", "municipality", "latitude", "longitude"],
+            dropna=False,
+        )
+        .agg(agg)
+        .reset_index()
     )
-
-
-def create_madrid_map():
-    """Crea mapa con estaciones de Madrid."""
-    stations = [
-        {"name": "Plaza España", "lat": 40.423, "lon": -3.712,
-         "aqi_value": 45, "pm25": 16, "pm10": 32, "no2": 52, "o3": 45},
-        {"name": "Retiro", "lat": 40.417, "lon": -3.683,
-         "aqi_value": 30, "pm25": 10, "pm10": 22, "no2": 35, "o3": 58},
-        {"name": "Cuatro Caminos", "lat": 40.446, "lon": -3.707,
-         "aqi_value": 48, "pm25": 17, "pm10": 34, "no2": 55, "o3": 42},
-        {"name": "Escuelas Aguirre", "lat": 40.421, "lon": -3.683,
-         "aqi_value": 35, "pm25": 12, "pm10": 25, "no2": 40, "o3": 50},
-        {"name": "Barajas", "lat": 40.472, "lon": -3.561,
-         "aqi_value": 32, "pm25": 11, "pm10": 24, "no2": 38, "o3": 55},
-    ]
-
-    for s in stations:
-        s["color"] = get_aqi_color(s["aqi_value"])
-        s["aqi_category"] = get_aqi_category(s["aqi_value"])
-
-    return create_station_map(
-        stations, center_lat=40.425, center_lon=-3.690, zoom_start=12
-    )
-
-
-if __name__ == "__main__":
-    m = create_barcelona_map()
-    m.save("barcelona_air_quality_map.html")
-    print("Mapa guardado: barcelona_air_quality_map.html")
+    return summary

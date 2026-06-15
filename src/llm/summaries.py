@@ -1,240 +1,303 @@
 """
-Generación de resúmenes diarios de calidad del aire usando LLM.
+Resúmenes diarios generados con LLM a partir del Data Warehouse.
 
-Utiliza API compatible con OpenAI para generar reportes legibles
-sobre el estado de la calidad del aire.
+Soporta Ollama (local), OpenAI y generación narrativa automática como respaldo.
 """
 
-import os
-import json
-import pandas as pd
-import numpy as np
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
-from dotenv import load_dotenv
+
+import httpx
+import pandas as pd
+
+from src.config import (
+    LLM_API_KEY,
+    LLM_API_URL,
+    LLM_MODEL,
+    LLM_PROVIDER,
+    REPORTS_DIR,
+    WHO_LIMITS,
+    ensure_dirs,
+)
+from src.gold.loader import query_facts, query_kpis
+from src.ml.alerts import run_alerts
 
 
-load_dotenv()
+def _build_prompt(kpis: dict, alerts: list, df: pd.DataFrame) -> str:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    alert_lines = [
+        f"- {a['station']} ({a['municipality']}): {a['pollutant']} = "
+        f"{a['value']} µg/m³ (límite OMS {a['limit']})"
+        for a in alerts[:8]
+    ]
+    alert_text = "\n".join(alert_lines) if alert_lines else "Sin alertas activas."
 
-API_KEY = os.getenv("LLM_API_KEY", "")
-API_URL = os.getenv("LLM_API_URL", "https://api.openai.com/v1")
-MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    critical = kpis.get("critical_stations") or []
+    critical_text = ", ".join(
+        f"{s['station']} (AQI {s['avg_aqi']:.1f})" for s in critical[:5]
+    ) or "Ninguna"
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data"
-PROCESSED_DIR = DATA_DIR / "processed"
-REPORTS_DIR = Path(__file__).resolve().parents[2] / "reports"
+    return f"""Eres un analista ambiental. Redacta un informe ejecutivo diario sobre calidad del aire y clima en España.
 
+Fecha: {today}
+Registros analizados: {len(df)}
 
-def ensure_dirs():
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+Indicadores:
+- Temperatura media: {kpis.get('avg_temperature', 'N/A')} °C
+- Humedad media: {kpis.get('avg_humidity', 'N/A')} %
+- PM10 media: {kpis.get('avg_pm10', 'N/A')} µg/m³ (límite OMS: {WHO_LIMITS['pm10']})
+- PM2.5 media: {kpis.get('avg_pm25', 'N/A')} µg/m³ (límite OMS: {WHO_LIMITS['pm25']})
+- NO2 media: {kpis.get('avg_no2', 'N/A')} µg/m³ (límite OMS: {WHO_LIMITS['no2']})
+- Índice AQI medio: {kpis.get('avg_aqi', 'N/A')}
+- Estaciones críticas: {critical_text}
 
+Alertas:
+{alert_text}
 
-def load_latest_data():
-    """Carga los datos más recientes para el resumen."""
-    parquet_path = PROCESSED_DIR / "air_quality_merged.parquet"
-    if parquet_path.exists():
-        return pd.read_parquet(parquet_path)
-    csv_path = PROCESSED_DIR / "air_quality_merged.csv"
-    if csv_path.exists():
-        return pd.read_csv(csv_path, parse_dates=["timestamp"])
-    return None
+Escribe 3-4 párrafos en español, tono profesional y claro. Incluye:
+1. Evaluación general del día
+2. Contaminante más preocupante y zonas afectadas
+3. Relación con temperatura/humedad si es relevante
+4. Recomendaciones para población general y grupos sensibles
 
-
-def prepare_summary_data(df):
-    """
-    Prepara estadísticas para el resumen diario.
-
-    Returns: dict con datos estructurados
-    """
-    if df is None or len(df) == 0:
-        return None
-
-    df = df.sort_values("timestamp")
-    latest_ts = df["timestamp"].max()
-    today_data = df[df["timestamp"].dt.date == latest_ts.date()]
-
-    if len(today_data) == 0:
-        today_data = df.tail(24)
-
-    pollutants = {}
-    for col in ["pm2_5", "pm10", "no2", "o3", "so2", "co", "european_aqi"]:
-        if col in today_data.columns:
-            vals = today_data[col].dropna()
-            if len(vals) > 0:
-                pollutants[col] = {
-                    "mean": round(vals.mean(), 1),
-                    "max": round(vals.max(), 1),
-                    "min": round(vals.min(), 1),
-                }
-
-    locations_data = {}
-    if "location" in today_data.columns:
-        for loc in today_data["location"].unique():
-            loc_df = today_data[today_data["location"] == loc]
-            loc_stats = {}
-            for col in ["pm2_5", "pm10", "no2", "european_aqi"]:
-                if col in loc_df.columns:
-                    vals = loc_df[col].dropna()
-                    if len(vals) > 0:
-                        loc_stats[col] = round(vals.mean(), 1)
-            if loc_stats:
-                locations_data[loc] = loc_stats
-
-    summary = {
-        "date": latest_ts.strftime("%Y-%m-%d"),
-        "total_records": len(today_data),
-        "locations_count": len(locations_data),
-        "pollutants": pollutants,
-        "locations": locations_data,
-        "data_sources": (
-            df["source"].unique().tolist()
-            if "source" in df.columns
-            else ["unknown"]
-        ),
-    }
-
-    return summary
+No uses encabezados markdown ni listas numeradas. Solo párrafos."""
 
 
-def generate_prompt(summary_data):
-    """Genera el prompt para el LLM."""
-    if summary_data is None:
-        return "No hay datos disponibles para generar un resumen."
-
-    date = summary_data["date"]
-    locs = summary_data["locations"]
-    pols = summary_data["pollutants"]
-
-    poll_details = ""
-    for name, vals in pols.items():
-        poll_details += f"  - {name}: media {vals['mean']}, máx {vals['max']}, mín {vals['min']}\n"
-
-    loc_details = ""
-    for name, vals in list(locs.items())[:5]:
-        vals_str = ", ".join([f"{k}: {v}" for k, v in vals.items()])
-        loc_details += f"  - {name}: {vals_str}\n"
-
-    prompt = f"""Eres un analista ambiental. Genera un resumen ejecutivo breve de la calidad del aire.
-
-Fecha: {date}
-Registros analizados: {summary_data['total_records']}
-Ubicaciones monitoreadas: {summary_data['locations_count']}
-Fuentes de datos: {', '.join(summary_data['data_sources'])}
-
-Promedios de contaminantes:
-{poll_details}
-
-Datos por ubicación:
-{loc_details}
-
-Genera un reporte de 3-4 párrafos que incluya:
-1. Estado general de la calidad del aire
-2. Contaminante más problemático y sus niveles
-3. Ubicaciones con mejor y peor calidad del aire
-4. Comparación con estándares de la OMS (si aplica)
-5. Recomendaciones para la población
-
-Usa lenguaje claro y accesible. Incluye datos numéricos relevantes.
-Responde en español.
-"""
-    return prompt
+def _aqi_category(value: float | None) -> str:
+    if value is None:
+        return "desconocida"
+    if value <= 25:
+        return "buena"
+    if value <= 50:
+        return "moderada"
+    return "mala"
 
 
-def call_llm_api(prompt, max_tokens=800):
-    """
-    Llama a la API del LLM para generar el resumen.
-
-    Si no hay API key configurada, genera un resumen basado en reglas.
-    """
-    if API_KEY and API_KEY != "your_llm_api_key_here":
-        try:
-            import httpx
-
-            headers = {
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json",
-            }
-
-            payload = {
-                "model": MODEL,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Eres un asistente experto en calidad del aire y datos ambientales.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                "max_tokens": max_tokens,
-                "temperature": 0.7,
-            }
-
-            with httpx.Client(timeout=30) as client:
-                response = client.post(
-                    f"{API_URL}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                )
-                response.raise_for_status()
-                result = response.json()
-                return result["choices"][0]["message"]["content"]
-
-        except Exception as e:
-            print(f"[LLM] Error llamando API: {e}")
-            return fallback_summary(prompt)
-
-    return fallback_summary(prompt)
+def _worst_pollutant(kpis: dict) -> tuple[str, float | None, float]:
+    candidates = [
+        ("PM2.5", kpis.get("avg_pm25"), WHO_LIMITS["pm25"]),
+        ("NO2", kpis.get("avg_no2"), WHO_LIMITS["no2"]),
+        ("PM10", kpis.get("avg_pm10"), WHO_LIMITS["pm10"]),
+    ]
+    scored = [
+        (name, val, limit, val / limit)
+        for name, val, limit in candidates
+        if val is not None and limit
+    ]
+    if not scored:
+        return "PM2.5", None, WHO_LIMITS["pm25"]
+    worst = max(scored, key=lambda x: x[3])
+    return worst[0], worst[1], worst[2]
 
 
-def fallback_summary(prompt):
-    """
-    Genera resumen basado en reglas cuando no hay LLM disponible.
-    """
-    return (
-        "📊 **Resumen de Calidad del Aire**\n\n"
-        "Basado en los datos recopilados por el sistema de monitoreo, "
-        "se observan niveles variables de contaminantes en las ubicaciones analizadas. "
-        "Se recomienda consultar el dashboard interactivo para visualizar "
-        "los datos detallados por estación y contaminante.\n\n"
-        "Para activar los resúmenes generados por IA, configura la variable "
-        "LLM_API_KEY en el archivo .env con una clave de API compatible con OpenAI.\n\n"
-        "📈 Los datos históricos y predicciones están disponibles en las "
-        "secciones de visualización del dashboard."
+def generate_narrative_summary(kpis: dict, alerts: list) -> str:
+    """Genera un informe narrativo completo sin depender de API externa."""
+    temp = kpis.get("avg_temperature")
+    humidity = kpis.get("avg_humidity")
+    pm25 = kpis.get("avg_pm25")
+    pm10 = kpis.get("avg_pm10")
+    no2 = kpis.get("avg_no2")
+    aqi = kpis.get("avg_aqi")
+    critical = kpis.get("critical_stations") or []
+
+    worst_name, worst_val, worst_limit = _worst_pollutant(kpis)
+    quality = _aqi_category(aqi)
+
+    p1 = (
+        f"Durante las últimas 24 horas, la calidad del aire registrada en las estaciones "
+        f"monitorizadas se clasifica como **{quality}**, con un índice AQI medio de "
+        f"**{aqi:.1f}** puntos"
+        if aqi is not None
+        else "Durante las últimas 24 horas, la calidad del aire en las estaciones monitorizadas "
+        "presenta niveles variables"
     )
+    if temp is not None:
+        p1 += (
+            f". Las condiciones meteorológicas muestran una temperatura media de "
+            f"**{temp:.1f} °C**"
+        )
+        if humidity is not None:
+            p1 += f" y una humedad relativa del **{humidity:.1f}%**"
+    p1 += "."
+
+    p2_parts = []
+    if worst_val is not None:
+        ratio = worst_val / worst_limit
+        p2_parts.append(
+            f"El contaminante más relevante del periodo es **{worst_name}**, "
+            f"con una concentración media de **{worst_val:.1f} µg/m³**, "
+            f"{'superior' if ratio > 1 else 'cercano'} al límite diario recomendado "
+            f"por la OMS (**{worst_limit:.0f} µg/m³**)."
+        )
+    if pm25 is not None and no2 is not None:
+        p2_parts.append(
+            f"En conjunto, PM2.5 alcanzó **{pm25:.1f} µg/m³** y NO2 **{no2:.1f} µg/m³**, "
+            f"valores que {'exceden' if pm25 > WHO_LIMITS['pm25'] or no2 > WHO_LIMITS['no2'] else 'se mantienen cerca de'} "
+            f"los umbrales de referencia internacional."
+        )
+    if critical:
+        stations = ", ".join(s["station"] for s in critical[:3])
+        p2_parts.append(
+            f"Destacan estaciones con mayor presión ambiental: **{stations}**."
+        )
+    p2 = " ".join(p2_parts)
+
+    p3 = ""
+    if temp is not None and temp > 25 and humidity is not None and humidity < 55:
+        p3 = (
+            "La combinación de temperaturas elevadas y baja humedad favorece la acumulación "
+            "de partículas en capas bajas de la atmósfera, lo que puede mantener "
+            "concentraciones de contaminantes por encima de lo habitual en áreas urbanas."
+        )
+    elif alerts:
+        p3 = (
+            f"Se han detectado **{len(alerts)} alerta(s)** por superación de límites OMS, "
+            "principalmente en zonas urbanas con tráfico intenso y actividad industrial."
+        )
+    else:
+        p3 = (
+            "No se registraron alertas críticas en el periodo, aunque conviene mantener "
+            "seguimiento en las estaciones con AQI más elevado."
+        )
+
+    if pm10 is not None:
+        p4 = (
+            "Se recomienda que personas con enfermedades respiratorias, niños y adultos mayores "
+            "limiten actividades prolongadas al aire libre en horas centrales del día. "
+            f"La población general puede realizar actividades normales, prestando atención "
+            f"a los picos de {worst_name} en las estaciones señaladas."
+        )
+    else:
+        p4 = (
+            "Se recomienda consultar el mapa de estaciones y las predicciones del dashboard "
+            "para planificar actividades al aire libre, especialmente para grupos sensibles."
+        )
+
+    return "\n\n".join(filter(None, [p1, p2, p3, p4]))
 
 
-def generate_daily_report(df=None):
+def _call_ollama(prompt: str) -> str:
+    base = LLM_API_URL.rstrip("/")
+    url = f"{base}/api/chat" if "/api" not in base else f"{base}/chat"
+    if base.endswith("/v1"):
+        url = f"{base}/chat/completions"
+
+    if "/chat/completions" in url:
+        payload = {
+            "model": LLM_MODEL,
+            "messages": [
+                {"role": "system", "content": "Experto en calidad del aire y meteorología en España."},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+        }
+        with httpx.Client(timeout=120) as client:
+            response = client.post(url, json=payload)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": "Experto en calidad del aire y meteorología en España."},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+    }
+    with httpx.Client(timeout=120) as client:
+        response = client.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()["message"]["content"]
+
+
+def _call_openai(prompt: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": "Experto en calidad del aire y meteorología en España."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 900,
+        "temperature": 0.7,
+    }
+    base = LLM_API_URL.rstrip("/")
+    url = f"{base}/chat/completions"
+    with httpx.Client(timeout=60) as client:
+        response = client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+
+
+def generate_report_text(kpis: dict, alerts: list, df: pd.DataFrame) -> tuple[str, str]:
     """
-    Genera y guarda un resumen diario.
+    Genera el cuerpo del informe.
+
+    Returns:
+        (texto_informe, origen) donde origen es 'ollama', 'openai' o 'narrativo'
     """
+    prompt = _build_prompt(kpis, alerts, df)
+    provider = LLM_PROVIDER.lower()
+
+    if provider == "ollama":
+        try:
+            return _call_ollama(prompt), "ollama"
+        except Exception as exc:
+            print(f"[LLM] Ollama no disponible ({exc}), usando generador narrativo")
+
+    if provider == "openai" and LLM_API_KEY and not LLM_API_KEY.startswith("your_"):
+        try:
+            return _call_openai(prompt), "openai"
+        except Exception as exc:
+            print(f"[LLM] OpenAI error ({exc}), usando generador narrativo")
+
+    return generate_narrative_summary(kpis, alerts), "narrativo"
+
+
+def _format_kpi_footer(kpis: dict) -> str:
+    rows = [
+        ("Temperatura media", f"{kpis['avg_temperature']:.1f} °C" if kpis.get("avg_temperature") else "—"),
+        ("Humedad media", f"{kpis['avg_humidity']:.1f} %" if kpis.get("avg_humidity") else "—"),
+        ("PM10 media", f"{kpis['avg_pm10']:.1f} µg/m³" if kpis.get("avg_pm10") else "—"),
+        ("PM2.5 media", f"{kpis['avg_pm25']:.1f} µg/m³" if kpis.get("avg_pm25") else "—"),
+        ("NO2 media", f"{kpis['avg_no2']:.1f} µg/m³" if kpis.get("avg_no2") else "—"),
+        ("AQI medio", f"{kpis['avg_aqi']:.1f}" if kpis.get("avg_aqi") else "—"),
+    ]
+    lines = "| Indicador | Valor |\n|---|---|\n"
+    lines += "\n".join(f"| {k} | {v} |" for k, v in rows)
+    return lines
+
+
+def generate_daily_report() -> Path | None:
     ensure_dirs()
+    df = query_facts(limit=3000)
+    kpis = query_kpis()
+    alerts = run_alerts()
 
-    if df is None:
-        df = load_latest_data()
-
-    summary_data = prepare_summary_data(df)
-    if summary_data is None:
-        print("[LLM] No hay datos para generar resumen")
+    if not kpis:
+        print("[LLM] No hay KPIs disponibles")
         return None
 
-    prompt = generate_prompt(summary_data)
-    report = call_llm_api(prompt)
+    report, source = generate_report_text(kpis, alerts, df)
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    date_str = summary_data["date"]
-    filename = REPORTS_DIR / f"resumen_calidad_aire_{date_str}.md"
-
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(f"# Resumen de Calidad del Aire - {date_str}\n\n")
-        f.write(report)
-        f.write("\n\n---\n")
-        f.write(f"*Generado el {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n")
-        f.write(f"*Fuentes: {', '.join(summary_data['data_sources'])}*\n")
-
-    print(f"[LLM] Resumen guardado: {filename}")
-    return filename, report
+    path = REPORTS_DIR / f"resumen_ambiental_{date_str}.md"
+    content = (
+        f"# Resumen Ambiental Diario — {date_str}\n\n"
+        f"{report}\n\n"
+        f"---\n\n"
+        f"### Indicadores del día\n\n"
+        f"{_format_kpi_footer(kpis)}\n\n"
+        f"*Generado: {generated} · Fuente: {source} · AEMET + MITECO*\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    print(f"[LLM] Resumen ({source}): {path}")
+    return path
 
 
 if __name__ == "__main__":
-    filepath, report = generate_daily_report()
-    if report:
-        print(f"\nResumen guardado en: {filepath}")
-        print(report[:500] + "...")
+    generate_daily_report()
