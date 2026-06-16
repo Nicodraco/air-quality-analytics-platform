@@ -14,6 +14,7 @@ from src.config import MODELS_DIR, WHO_LIMITS
 from src.dashboard.components.filters import render_sidebar_filters
 from src.dashboard.components.status_bar import render_status_bar
 from src.dashboard.components.styles import inject_styles
+from src.dashboard.services.data import get_storage_coverage
 from src.ml.predict import load_training_data, load_zone_forecasts, train_and_predict
 
 
@@ -23,8 +24,27 @@ render_sidebar_filters()
 st.markdown("<div class='main-title'>Predicciones ML por zona</div>", unsafe_allow_html=True)
 render_status_bar()
 
+coverage = get_storage_coverage()
+metric_cols = st.columns(len(coverage["datasets"]) + 1)
+for col, dataset in zip(metric_cols, coverage["datasets"]):
+    with col:
+        st.metric(dataset["label"], f"{dataset['days']:,} días")
+        if dataset["since"] and dataset["until"]:
+            st.caption(
+                f"{dataset['records']:,} registros · "
+                f"{dataset['since']} → {dataset['until']}"
+            )
+        else:
+            st.caption("Sin datos guardados")
+
+with metric_cols[-1]:
+    st.metric("Ventana configurada", f"{coverage['lookback_days']:,} días")
+    st.caption(
+        f"Mínimo ML: {coverage['ml_min_training_days']} días por zona"
+    )
+
 st.info(
-    "Random Forest entrenado con histórico de hasta 90 días. "
+    f"Random Forest entrenado con histórico de hasta {coverage['lookback_days']:,} días. "
     "Los pronósticos se cargan desde el pipeline; usa el botón para reentrenar bajo demanda."
 )
 

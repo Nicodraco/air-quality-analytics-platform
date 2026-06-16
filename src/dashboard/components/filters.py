@@ -2,7 +2,7 @@
 
 import streamlit as st
 
-from src.dashboard.services.data import WINDOW_PRESETS, load_region_options
+from src.dashboard.services.data import WINDOW_PRESET_LABELS, WINDOW_PRESETS, load_region_options
 
 
 def _init_session_state() -> None:
@@ -22,11 +22,13 @@ def render_sidebar_filters() -> None:
     st.sidebar.markdown("---")
     st.sidebar.subheader("Filtros")
 
+    preset_keys = list(WINDOW_PRESETS.keys())
+    current = st.session_state.window_preset
     preset = st.sidebar.selectbox(
         "Ventana temporal",
-        options=list(WINDOW_PRESETS.keys()),
-        index=list(WINDOW_PRESETS.keys()).index(st.session_state.window_preset),
-        format_func=lambda k: {"24h": "Últimas 24 h", "7d": "Últimos 7 días", "30d": "Últimos 30 días", "90d": "Últimos 90 días"}[k],
+        options=preset_keys,
+        index=preset_keys.index(current) if current in preset_keys else preset_keys.index("7d"),
+        format_func=lambda k: WINDOW_PRESET_LABELS[k],
     )
     st.session_state.window_preset = preset
 

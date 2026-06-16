@@ -33,10 +33,36 @@ pollutant = st.selectbox(
     [c for c in ["pm25", "pm10", "no2", "temperature", "humidity", "aqi_index"] if c in df.columns],
 )
 
-daily = df.groupby(df["measured_at"].dt.date)[pollutant].mean().reset_index()
-daily.columns = ["fecha", pollutant]
+WEATHER_INDICATORS = {"temperature", "humidity", "precipitation", "wind_speed"}
+series_df = df.dropna(subset=[pollutant])
+if pollutant in WEATHER_INDICATORS and "station_type" in series_df.columns:
+    met = series_df[series_df["station_type"] == "meteorological"]
+    if not met.empty:
+        series_df = met
 
-fig = px.line(daily, x="fecha", y=pollutant, markers=True, title=f"Tendencia diaria — {pollutant}")
+if series_df.empty:
+    st.warning(f"Sin mediciones de {pollutant} en la ventana seleccionada.")
+    st.stop()
+
+unique_days = series_df["measured_at"].dt.floor("D").nunique()
+if unique_days > 1:
+    trend = series_df.groupby(series_df["measured_at"].dt.date)[pollutant].mean().reset_index()
+    trend.columns = ["fecha", pollutant]
+    chart_title = f"Tendencia diaria — {pollutant}"
+else:
+    trend = (
+        series_df.groupby(series_df["measured_at"].dt.floor("h"))[pollutant]
+        .mean()
+        .reset_index()
+    )
+    trend.columns = ["fecha", pollutant]
+    chart_title = f"Tendencia horaria — {pollutant}"
+    st.info(
+        "Solo hay datos meteorológicos de un día en la ventana; "
+        "se muestra la evolución horaria."
+    )
+
+fig = px.line(trend, x="fecha", y=pollutant, markers=True, title=chart_title)
 who_limit = WHO_LIMITS.get(pollutant)
 if who_limit is not None:
     fig.add_hline(
@@ -47,7 +73,7 @@ if who_limit is not None:
     )
 st.plotly_chart(fig, use_container_width=True)
 
-if "region" in df.columns:
-    regional = df.groupby("region")[pollutant].mean().sort_values(ascending=False)
+if "region" in series_df.columns:
+    regional = series_df.groupby("region")[pollutant].mean().sort_values(ascending=False)
     fig2 = px.bar(regional, title=f"{pollutant} promedio por región")
     st.plotly_chart(fig2, use_container_width=True)

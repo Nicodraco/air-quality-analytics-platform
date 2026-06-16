@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
 
-from src.config import SILVER_DIR
+from src.config import INGESTION_LOOKBACK_DAYS, ML_MIN_TRAINING_DAYS, SILVER_DIR
 from src.gold.loader import check_db_connection, get_available_regions, query_facts, query_kpis
 from src.utils.maps import aqi_category
 
@@ -16,6 +16,25 @@ WINDOW_PRESETS = {
     "7d": 7,
     "30d": 30,
     "90d": 90,
+    "6m": 180,
+    "1y": 365,
+    "2y": 730,
+    "3y": 1095,
+    "4y": 1460,
+    "5y": 1825,
+}
+
+WINDOW_PRESET_LABELS = {
+    "24h": "Últimas 24 h",
+    "7d": "Últimos 7 días",
+    "30d": "1 mes",
+    "90d": "Últimos 90 días",
+    "6m": "6 meses",
+    "1y": "1 año",
+    "2y": "2 años",
+    "3y": "3 años",
+    "4y": "4 años",
+    "5y": "5 años",
 }
 
 _DATA_STATUS: dict = {"source": "gold", "db_ok": True, "record_count": 0, "last_measured_at": None}
@@ -255,6 +274,59 @@ def load_filtered_kpis() -> dict:
 
 def get_data_status() -> dict:
     return dict(_DATA_STATUS)
+
+
+_SILVER_DATASETS = (
+    ("silver_air_quality", "Calidad del aire"),
+    ("silver_weather", "Meteorología"),
+)
+
+
+@st.cache_data(ttl=300)
+def get_storage_coverage() -> dict:
+    """Resumen de datos persistidos en Silver: días cubiertos y volumen."""
+    datasets: list[dict] = []
+
+    for filename, label in _SILVER_DATASETS:
+        path = SILVER_DIR / f"{filename}.parquet"
+        if not path.exists():
+            datasets.append({
+                "key": filename,
+                "label": label,
+                "records": 0,
+                "days": 0,
+                "since": None,
+                "until": None,
+            })
+            continue
+
+        df = pd.read_parquet(path)
+        if df.empty or "timestamp" not in df.columns:
+            datasets.append({
+                "key": filename,
+                "label": label,
+                "records": 0,
+                "days": 0,
+                "since": None,
+                "until": None,
+            })
+            continue
+
+        ts = pd.to_datetime(df["timestamp"], utc=True)
+        datasets.append({
+            "key": filename,
+            "label": label,
+            "records": len(df),
+            "days": int(ts.dt.floor("D").nunique()),
+            "since": ts.min().date(),
+            "until": ts.max().date(),
+        })
+
+    return {
+        "datasets": datasets,
+        "lookback_days": INGESTION_LOOKBACK_DAYS,
+        "ml_min_training_days": ML_MIN_TRAINING_DAYS,
+    }
 
 
 def load_region_options() -> list[str]:
