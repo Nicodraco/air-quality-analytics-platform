@@ -52,7 +52,8 @@ def transform_weather(bronze_aemet: dict[str, Any]) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["country"] = "España"
-    df["source"] = "aemet"
+    if "source" not in df.columns:
+        df["source"] = "aemet"
     df["station_type"] = "meteorological"
 
     keep = [
@@ -108,7 +109,7 @@ def transform_stations(
             "municipality": record.get("municipality"),
             "latitude": record.get("latitude"),
             "longitude": record.get("longitude"),
-            "source": "aemet",
+            "source": record.get("source", "aemet"),
             "station_type": "meteorological",
         })
 

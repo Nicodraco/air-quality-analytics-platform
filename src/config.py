@@ -25,6 +25,9 @@ AEMET_BASE_URL = _env(
 )
 URL_BUSQUEDA_MITECO = _env("URL_BUSQUEDA_MITECO", "https://miteco.gob.es")
 URL_DATASTORE_MITECO = _env("URL_DATASTORE_MITECO", "https://miteco.gob.es")
+OPENMETEO_ARCHIVE_URL = _env(
+    "OPENMETEO_ARCHIVE_URL", "https://archive-api.open-meteo.com/v1/archive"
+)
 
 # --- MinIO (Bronze) ---
 MINIO_ENDPOINT = _env("MINIO_ENDPOINT", "localhost:9000")
@@ -49,7 +52,8 @@ ML_MIN_TRAINING_DAYS = int(_env("ML_MIN_TRAINING_DAYS", "21"))
 LLM_PROVIDER = _env("LLM_PROVIDER", "narrativo")  # ollama | openai | narrativo
 LLM_API_KEY = _env("LLM_API_KEY")
 LLM_API_URL = _env("LLM_API_URL", "http://localhost:11434")
-LLM_MODEL = _env("LLM_MODEL", "llama3")
+LLM_MODEL = _env("LLM_MODEL", "gemma4:e4b")
+LLM_TIMEOUT_SECONDS = int(_env("LLM_TIMEOUT_SECONDS", "300"))
 
 # --- Rutas locales ---
 DATA_DIR = ROOT_DIR / "data"
@@ -61,12 +65,53 @@ MODELS_DIR = ROOT_DIR / "models"
 # --- Pipeline ---
 PIPELINE_INTERVAL_MINUTES = int(_env("PIPELINE_INTERVAL_MINUTES", "60"))
 
-# Estaciones AEMET prioritarias (Madrid, Barcelona, Valencia, Sevilla)
+# Estaciones meteorológicas prioritarias (Madrid, Barcelona, Valencia, Sevilla)
+WEATHER_STATIONS = [
+    {
+        "id": "3195",
+        "name": "Madrid Retiro",
+        "region": "Comunidad de Madrid",
+        "municipality": "Madrid",
+        "latitude": 40.411,
+        "longitude": -3.682,
+    },
+    {
+        "id": "0076",
+        "name": "Barcelona Fabra",
+        "region": "Cataluña",
+        "municipality": "Barcelona",
+        "latitude": 41.418,
+        "longitude": 2.124,
+    },
+    {
+        "id": "8416A",
+        "name": "Valencia",
+        "region": "Comunidad Valenciana",
+        "municipality": "Valencia",
+        "latitude": 39.486,
+        "longitude": -0.361,
+    },
+    {
+        "id": "5783",
+        "name": "Sevilla",
+        "region": "Andalucía",
+        "municipality": "Sevilla",
+        "latitude": 37.388,
+        "longitude": -5.984,
+    },
+]
+
+# Alias retrocompatible con ingesta AEMET
 AEMET_STATIONS = [
-    {"idema": "3195", "name": "Madrid Retiro", "region": "Comunidad de Madrid", "municipality": "Madrid"},
-    {"idema": "0076", "name": "Barcelona Fabra", "region": "Cataluña", "municipality": "Barcelona"},
-    {"idema": "8416A", "name": "Valencia", "region": "Comunidad Valenciana", "municipality": "Valencia"},
-    {"idema": "5783", "name": "Sevilla", "region": "Andalucía", "municipality": "Sevilla"},
+    {
+        "idema": s["id"],
+        "name": s["name"],
+        "region": s["region"],
+        "municipality": s["municipality"],
+        "latitud": s["latitude"],
+        "longitud": s["longitude"],
+    }
+    for s in WEATHER_STATIONS
 ]
 
 # Límites OMS (µg/m³) para alertas

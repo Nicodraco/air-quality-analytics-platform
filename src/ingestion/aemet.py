@@ -57,14 +57,11 @@ class AemetClient:
 
     def fetch_station_observation(self, idema: str) -> list[dict]:
         endpoint = f"observacion/convencional/datos/estacion/{idema}"
-        try:
-            data = self.fetch(endpoint)
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                return [data]
-        except Exception as exc:
-            print(f"[AEMET] Observación {idema} no disponible: {exc}")
+        data = self.fetch(endpoint)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return [data]
         return []
 
     def fetch_daily_climatology(
@@ -75,12 +72,8 @@ class AemetClient:
             f"valores/climatologicos/diarios/datos/fechaini/"
             f"{start.strftime(fmt)}/fechafin/{end.strftime(fmt)}/estacion/{idema}"
         )
-        try:
-            data = self.fetch(endpoint)
-            return data if isinstance(data, list) else []
-        except Exception as exc:
-            print(f"[AEMET] Climatología diaria {idema}: {exc}")
-            return []
+        data = self.fetch(endpoint)
+        return data if isinstance(data, list) else []
 
 
 def _parse_observation(record: dict, station_meta: dict) -> dict:
@@ -152,9 +145,19 @@ def _fetch_climatology_chunks(
     return records
 
 
+def _abort_aemet(payload: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    payload["error"] = str(exc)
+    print(f"[AEMET] Fuente no disponible ({exc}); se continúa con la siguiente fuente.")
+    print(f"[AEMET] Total registros meteorológicos: {len(payload['weather_records'])}")
+    return payload
+
+
 def ingest_aemet(api_key: str | None = None) -> dict[str, Any]:
     """
     Ejecuta ingesta AEMET completa con histórico configurable.
+
+    Ante el primer error de red o API, aborta el resto de llamadas AEMET
+    y devuelve el payload parcial para que el pipeline siga con MITECO.
 
     Returns:
         dict con keys: stations_inventory, weather_records, metadata
@@ -176,7 +179,7 @@ def ingest_aemet(api_key: str | None = None) -> dict[str, Any]:
         payload["stations_inventory"] = inventory[:500]
         print(f"[AEMET] Inventario: {len(inventory)} estaciones")
     except Exception as exc:
-        print(f"[AEMET] Inventario no disponible: {exc}")
+        return _abort_aemet(payload, exc)
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=INGESTION_LOOKBACK_DAYS)
@@ -187,21 +190,25 @@ def ingest_aemet(api_key: str | None = None) -> dict[str, Any]:
         records: list[dict] = []
         seen: set[str] = set()
 
-        daily = _fetch_climatology_chunks(client, idema, start, end)
-        for row in daily:
-            parsed = _parse_daily(row, station)
-            key = f"{parsed['station_id']}|{parsed['timestamp']}"
-            if key not in seen:
-                seen.add(key)
-                records.append(parsed)
+        try:
+            daily = _fetch_climatology_chunks(client, idema, start, end)
+            for row in daily:
+                parsed = _parse_daily(row, station)
+                key = f"{parsed['station_id']}|{parsed['timestamp']}"
+                if key not in seen:
+                    seen.add(key)
+                    records.append(parsed)
 
-        obs = client.fetch_station_observation(idema)
-        for row in obs:
-            parsed = _parse_observation(row, station)
-            key = f"{parsed['station_id']}|{parsed['timestamp']}"
-            if key not in seen:
-                seen.add(key)
-                records.append(parsed)
+            obs = client.fetch_station_observation(idema)
+            for row in obs:
+                parsed = _parse_observation(row, station)
+                key = f"{parsed['station_id']}|{parsed['timestamp']}"
+                if key not in seen:
+                    seen.add(key)
+                    records.append(parsed)
+        except Exception as exc:
+            payload["weather_records"].extend(records)
+            return _abort_aemet(payload, exc)
 
         payload["weather_records"].extend(records)
         print(f"[AEMET] {station['name']}: {len(records)} registros")

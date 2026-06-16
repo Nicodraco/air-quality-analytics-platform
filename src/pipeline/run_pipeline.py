@@ -13,8 +13,8 @@ sys.path.insert(0, str(ROOT))
 from src.bronze.storage import save_bronze
 from src.config import ensure_dirs
 from src.gold.loader import load_gold, query_kpis
-from src.ingestion.aemet import ingest_aemet
 from src.ingestion.miteco import ingest_miteco
+from src.ingestion.weather import ingest_weather
 from src.llm.summaries import generate_daily_report
 from src.ml.alerts import run_alerts
 from src.ml.predict import run_ml_pipeline
@@ -43,10 +43,11 @@ def run_full_pipeline(skip_ml: bool = False, skip_llm: bool = False) -> dict:
     print("=" * 70)
 
     try:
-        print("\n--- EXTRACCIÓN: AEMET ---")
-        aemet_data = ingest_aemet()
-        aemet_key = save_bronze("aemet", aemet_data)
-        summary["steps"]["bronze_aemet"] = aemet_key
+        print("\n--- EXTRACCIÓN: METEOROLOGÍA (AEMET / Open-Meteo) ---")
+        weather_data = ingest_weather()
+        weather_key = save_bronze("weather", weather_data)
+        summary["steps"]["bronze_weather"] = weather_key
+        summary["steps"]["weather_source"] = weather_data.get("weather_source", "unknown")
 
         print("\n--- EXTRACCIÓN: MITECO ---")
         miteco_data = ingest_miteco()
@@ -54,7 +55,7 @@ def run_full_pipeline(skip_ml: bool = False, skip_llm: bool = False) -> dict:
         summary["steps"]["bronze_miteco"] = miteco_key
 
         print("\n--- SILVER ---")
-        silver = run_silver_transform(aemet_data, miteco_data)
+        silver = run_silver_transform(weather_data, miteco_data)
         summary["steps"]["silver"] = {
             k: len(v) for k, v in silver.items() if v is not None
         }
