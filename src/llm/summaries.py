@@ -15,6 +15,7 @@ from src.config import (
     LLM_API_URL,
     LLM_MODEL,
     LLM_PROVIDER,
+    LLM_TIMEOUT_SECONDS,
     REPORTS_DIR,
     WHO_LIMITS,
     ensure_dirs,
@@ -60,7 +61,8 @@ Escribe 3-4 párrafos en español, tono profesional y claro. Incluye:
 3. Relación con temperatura/humedad si es relevante
 4. Recomendaciones para población general y grupos sensibles
 
-No uses encabezados markdown ni listas numeradas. Solo párrafos."""
+No uses encabezados markdown ni listas numeradas. Solo párrafos.
+No uses notación LaTeX ni fórmulas matemáticas; escribe los contaminantes en texto plano (PM2.5, NO2, etc.)."""
 
 
 def _aqi_category(value: float | None) -> str:
@@ -176,38 +178,54 @@ def generate_narrative_summary(kpis: dict, alerts: list) -> str:
     return "\n\n".join(filter(None, [p1, p2, p3, p4]))
 
 
-def _call_ollama(prompt: str) -> str:
+def _ollama_chat_url() -> str:
     base = LLM_API_URL.rstrip("/")
-    url = f"{base}/api/chat" if "/api" not in base else f"{base}/chat"
     if base.endswith("/v1"):
-        url = f"{base}/chat/completions"
+        return f"{base}/chat/completions"
+    if base.endswith("/api"):
+        return f"{base}/chat"
+    return f"{base}/api/chat"
 
-    if "/chat/completions" in url:
+
+def _call_ollama(prompt: str) -> str:
+    url = _ollama_chat_url()
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres un analista ambiental experto en calidad del aire y meteorología en España. "
+                "Respondes siempre en español, con tono profesional y claro."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    if url.endswith("/chat/completions"):
         payload = {
             "model": LLM_MODEL,
-            "messages": [
-                {"role": "system", "content": "Experto en calidad del aire y meteorología en España."},
-                {"role": "user", "content": prompt},
-            ],
+            "messages": messages,
             "stream": False,
+            "temperature": 0.6,
         }
-        with httpx.Client(timeout=120) as client:
+        with httpx.Client(timeout=LLM_TIMEOUT_SECONDS) as client:
             response = client.post(url, json=payload)
             response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
+            return response.json()["choices"][0]["message"]["content"].strip()
 
     payload = {
         "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": "Experto en calidad del aire y meteorología en España."},
-            {"role": "user", "content": prompt},
-        ],
+        "messages": messages,
         "stream": False,
+        "options": {"temperature": 0.6, "num_predict": 1500},
     }
-    with httpx.Client(timeout=120) as client:
+    with httpx.Client(timeout=LLM_TIMEOUT_SECONDS) as client:
         response = client.post(url, json=payload)
         response.raise_for_status()
-        return response.json()["message"]["content"]
+        data = response.json()
+        content = data.get("message", {}).get("content", "")
+        if not content:
+            raise RuntimeError(f"Ollama devolvió respuesta vacía: {data}")
+        return content.strip()
 
 
 def _call_openai(prompt: str) -> str:
