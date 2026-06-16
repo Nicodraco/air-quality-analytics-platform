@@ -2,13 +2,15 @@
 Capa Gold: carga al Data Warehouse PostgreSQL (Modelo Estrella).
 """
 
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from src.config import SILVER_DIR, postgres_url
+from src.utils.maps import aqi_category
 
 
 POLLUTANT_SEED = [
@@ -234,63 +236,253 @@ def load_gold() -> int:
     return inserted
 
 
-def query_kpis(engine: Engine | None = None) -> dict:
-    """Consulta KPIs desde el Data Warehouse."""
+@dataclass
+class QueryFilters:
+    since: datetime | None = None
+    until: datetime | None = None
+    regions: list[str] | None = None
+    station_types: list[str] | None = None
+
+
+_FACTS_SELECT = """
+    SELECT
+        f.measured_at,
+        f.temperature, f.humidity, f.precipitation, f.wind_speed,
+        f.pm10, f.pm25, f.no2, f.so2, f.o3, f.co, f.aqi_index,
+        ds.station_id, ds.station_name, ds.source, ds.station_type,
+        dl.region, dl.municipality, dl.latitude, dl.longitude
+    FROM fact_environmental_measures f
+    JOIN dim_station ds ON f.station_key = ds.station_key
+    JOIN dim_location dl ON f.location_key = dl.location_key
+"""
+
+
+def _default_window(days: int = 7) -> tuple[datetime, datetime]:
+    until = datetime.now(timezone.utc)
+    since = until - timedelta(days=days)
+    return since, until
+
+
+def _build_filter_clause(filters: QueryFilters | None) -> tuple[str, dict]:
+    """Construye cláusula WHERE y parámetros para filtros opcionales."""
+    clauses: list[str] = []
+    params: dict = {}
+
+    if not filters:
+        return "", params
+
+    if filters.since is not None:
+        clauses.append("f.measured_at >= :since")
+        params["since"] = filters.since
+    if filters.until is not None:
+        clauses.append("f.measured_at <= :until")
+        params["until"] = filters.until
+    if filters.regions:
+        placeholders = ", ".join(f":region_{i}" for i in range(len(filters.regions)))
+        clauses.append(f"dl.region IN ({placeholders})")
+        for i, region in enumerate(filters.regions):
+            params[f"region_{i}"] = region
+    if filters.station_types:
+        placeholders = ", ".join(f":stype_{i}" for i in range(len(filters.station_types)))
+        clauses.append(f"ds.station_type IN ({placeholders})")
+        for i, stype in enumerate(filters.station_types):
+            params[f"stype_{i}"] = stype
+
+    if not clauses:
+        return "", params
+    return " WHERE " + " AND ".join(clauses), params
+
+
+def check_db_connection(engine: Engine | None = None) -> bool:
     engine = engine or get_engine()
-    kpis = {}
-
-    queries = {
-        "avg_temperature": "SELECT AVG(temperature) FROM fact_environmental_measures WHERE temperature IS NOT NULL",
-        "avg_humidity": "SELECT AVG(humidity) FROM fact_environmental_measures WHERE humidity IS NOT NULL",
-        "avg_pm10": "SELECT AVG(pm10) FROM fact_environmental_measures WHERE pm10 IS NOT NULL",
-        "avg_pm25": "SELECT AVG(pm25) FROM fact_environmental_measures WHERE pm25 IS NOT NULL",
-        "avg_no2": "SELECT AVG(no2) FROM fact_environmental_measures WHERE no2 IS NOT NULL",
-        "avg_aqi": "SELECT AVG(aqi_index) FROM fact_environmental_measures WHERE aqi_index IS NOT NULL",
-        "critical_stations": """
-            SELECT ds.station_name, AVG(f.aqi_index) AS avg_aqi
-            FROM fact_environmental_measures f
-            JOIN dim_station ds ON f.station_key = ds.station_key
-            WHERE f.aqi_index IS NOT NULL
-            GROUP BY ds.station_name
-            HAVING AVG(f.aqi_index) > 50
-            ORDER BY avg_aqi DESC
-            LIMIT 10
-        """,
-    }
-
     try:
         with engine.connect() as conn:
-            for key, sql in queries.items():
-                if key == "critical_stations":
-                    rows = conn.execute(text(sql)).fetchall()
-                    kpis[key] = [{"station": r[0], "avg_aqi": float(r[1])} for r in rows]
-                else:
-                    val = conn.execute(text(sql)).scalar()
-                    kpis[key] = round(float(val), 2) if val is not None else None
-    except Exception as exc:
-        print(f"[Gold] Error consultando KPIs: {exc}")
-
-    return kpis
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
 
 
-def query_facts(limit: int = 5000) -> pd.DataFrame:
-    """Obtiene hechos con dimensiones para dashboard/ML."""
-    engine = get_engine()
+def get_available_regions(engine: Engine | None = None) -> list[str]:
+    engine = engine or get_engine()
     sql = text("""
-        SELECT
-            f.measured_at,
-            f.temperature, f.humidity, f.precipitation, f.wind_speed,
-            f.pm10, f.pm25, f.no2, f.so2, f.o3, f.co, f.aqi_index,
-            ds.station_id, ds.station_name, ds.source, ds.station_type,
-            dl.region, dl.municipality, dl.latitude, dl.longitude
+        SELECT DISTINCT dl.region
+        FROM dim_location dl
+        WHERE dl.region IS NOT NULL
+        ORDER BY dl.region
+    """)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(sql).fetchall()
+        return [r[0] for r in rows if r[0]]
+    except Exception as exc:
+        print(f"[Gold] Error get_available_regions: {exc}")
+        return []
+
+
+def _scalar_avg(
+    conn,
+    column: str,
+    extra_where: str,
+    params: dict,
+) -> float | None:
+    sql = f"""
+        SELECT AVG(f.{column})
         FROM fact_environmental_measures f
         JOIN dim_station ds ON f.station_key = ds.station_key
         JOIN dim_location dl ON f.location_key = dl.location_key
-        ORDER BY f.measured_at DESC
-        LIMIT :limit
-    """)
+        WHERE f.{column} IS NOT NULL {extra_where}
+    """
+    val = conn.execute(text(sql), params).scalar()
+    return round(float(val), 2) if val is not None else None
+
+
+def _period_metrics(conn, filter_clause: str, params: dict) -> dict:
+    return {
+        "avg_temperature": _scalar_avg(conn, "temperature", filter_clause, params),
+        "avg_humidity": _scalar_avg(conn, "humidity", filter_clause, params),
+        "avg_pm10": _scalar_avg(conn, "pm10", filter_clause, params),
+        "avg_pm25": _scalar_avg(conn, "pm25", filter_clause, params),
+        "avg_no2": _scalar_avg(conn, "no2", filter_clause, params),
+        "avg_aqi": _scalar_avg(conn, "aqi_index", filter_clause, params),
+    }
+
+
+def _critical_stations(conn, filter_clause: str, params: dict) -> list[dict]:
+    sql = f"""
+        SELECT ds.station_name, AVG(f.aqi_index) AS avg_aqi
+        FROM fact_environmental_measures f
+        JOIN dim_station ds ON f.station_key = ds.station_key
+        JOIN dim_location dl ON f.location_key = dl.location_key
+        WHERE f.aqi_index IS NOT NULL {filter_clause}
+        GROUP BY ds.station_name
+        HAVING AVG(f.aqi_index) > 50
+        ORDER BY avg_aqi DESC
+        LIMIT 10
+    """
+    rows = conn.execute(text(sql), params).fetchall()
+    return [{"station": r[0], "avg_aqi": float(r[1])} for r in rows]
+
+
+def _aqi_distribution(conn, filter_clause: str, params: dict) -> dict:
+    sql = f"""
+        SELECT f.aqi_index
+        FROM fact_environmental_measures f
+        JOIN dim_station ds ON f.station_key = ds.station_key
+        JOIN dim_location dl ON f.location_key = dl.location_key
+        WHERE f.aqi_index IS NOT NULL {filter_clause}
+    """
+    rows = conn.execute(text(sql), params).fetchall()
+    dist = {"bueno": 0, "moderado": 0, "critico": 0}
+    for (val,) in rows:
+        cat = aqi_category(float(val))
+        if cat in dist:
+            dist[cat] += 1
+    return dist
+
+
+def _compute_delta(current: dict, previous: dict) -> dict:
+    delta = {}
+    for key in current:
+        cur = current.get(key)
+        prev = previous.get(key)
+        if cur is not None and prev is not None:
+            delta[key] = round(cur - prev, 2)
+        else:
+            delta[key] = None
+    return delta
+
+
+def query_kpis(
+    engine: Engine | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    regions: list[str] | None = None,
+    station_types: list[str] | None = None,
+    enriched: bool = False,
+) -> dict:
+    """Consulta KPIs desde el Data Warehouse."""
+    engine = engine or get_engine()
+    filters = QueryFilters(since=since, until=until, regions=regions, station_types=station_types)
+
+    if enriched and since is None and until is None:
+        since, until = _default_window(days=7)
+        filters = QueryFilters(since=since, until=until, regions=regions, station_types=station_types)
+
+    base_clause, base_params = _build_filter_clause(filters)
+    period_clause = base_clause.replace(" WHERE ", " AND ") if base_clause else ""
+
     try:
-        return pd.read_sql(sql, engine, params={"limit": limit})
+        with engine.connect() as conn:
+            current = _period_metrics(conn, period_clause, base_params)
+            critical = _critical_stations(conn, period_clause, base_params)
+            aqi_dist = _aqi_distribution(conn, period_clause, base_params)
+
+            last_sql = f"""
+                SELECT MAX(f.measured_at)
+                FROM fact_environmental_measures f
+                JOIN dim_station ds ON f.station_key = ds.station_key
+                JOIN dim_location dl ON f.location_key = dl.location_key
+                {base_clause}
+            """
+            last_measured = conn.execute(text(last_sql), base_params).scalar()
+
+            previous = {k: None for k in current}
+            delta = {k: None for k in current}
+            if since is not None and until is not None:
+                duration = until - since
+                prev_until = since
+                prev_since = since - duration
+                prev_filters = QueryFilters(
+                    since=prev_since,
+                    until=prev_until,
+                    regions=regions,
+                    station_types=station_types,
+                )
+                prev_clause, prev_params = _build_filter_clause(prev_filters)
+                prev_period = prev_clause.replace(" WHERE ", " AND ") if prev_clause else ""
+                previous = _period_metrics(conn, prev_period, prev_params)
+                delta = _compute_delta(current, previous)
+
+            if not enriched:
+                current["critical_stations"] = critical
+                return current
+
+            return {
+                "window": {"since": since, "until": until},
+                "current": current,
+                "previous": previous,
+                "delta": delta,
+                "critical_stations": critical,
+                "last_measured_at": last_measured,
+                "aqi_distribution": aqi_dist,
+            }
+    except Exception as exc:
+        print(f"[Gold] Error consultando KPIs: {exc}")
+        if enriched:
+            return {"error": str(exc)}
+        return {}
+
+
+def query_facts(
+    limit: int = 5000,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    regions: list[str] | None = None,
+    station_types: list[str] | None = None,
+) -> pd.DataFrame:
+    """Obtiene hechos con dimensiones para dashboard/ML."""
+    engine = get_engine()
+    filters = QueryFilters(since=since, until=until, regions=regions, station_types=station_types)
+    where_clause, params = _build_filter_clause(filters)
+    params["limit"] = limit
+    sql = text(
+        _FACTS_SELECT
+        + where_clause
+        + " ORDER BY f.measured_at DESC LIMIT :limit"
+    )
+    try:
+        return pd.read_sql(sql, engine, params=params)
     except Exception as exc:
         print(f"[Gold] Error query_facts: {exc}")
         return pd.DataFrame()

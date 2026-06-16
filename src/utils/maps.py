@@ -14,6 +14,24 @@ from folium.plugins import HeatMap
 
 from src.config import REPORTS_DIR, WHO_LIMITS
 
+AQI_LEGEND = [
+    {"label": "Bueno", "range": "≤ 25", "color": "green"},
+    {"label": "Moderado", "range": "26–50", "color": "yellow"},
+    {"label": "Elevado", "range": "51–75", "color": "orange"},
+    {"label": "Crítico", "range": "> 75", "color": "red"},
+]
+
+
+def aqi_category(value: float | None) -> str:
+    """Clasifica AQI en bueno, moderado o critico."""
+    if value is None or pd.isna(value):
+        return "sin_datos"
+    if value <= 25:
+        return "bueno"
+    if value <= 50:
+        return "moderado"
+    return "critico"
+
 
 def aqi_color(value: float | None) -> str:
     if value is None or pd.isna(value):

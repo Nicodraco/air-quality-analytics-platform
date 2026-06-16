@@ -4,13 +4,13 @@ Capa Silver: limpieza, normalización y conversión a Parquet.
 Tablas: silver_weather, silver_air_quality, silver_stations
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from src.config import SILVER_DIR, ensure_dirs
+from src.config import INGESTION_LOOKBACK_DAYS, SILVER_DIR, ensure_dirs
 
 
 def _to_datetime(series: pd.Series) -> pd.Series:
@@ -144,6 +144,69 @@ def compute_aqi(row: pd.Series) -> float | None:
     return round(np.mean(scores), 1) if scores else None
 
 
+def _normalize_to_daily(df: pd.DataFrame) -> pd.DataFrame:
+    """Colapsa múltiples lecturas horarias al promedio diario por estación."""
+    if df.empty or "timestamp" not in df.columns:
+        return df
+
+    data = df.copy()
+    data["timestamp"] = _to_datetime(data["timestamp"])
+    data["date"] = data["timestamp"].dt.floor("D")
+
+    meta_cols = [
+        "station_id", "station_name", "region", "municipality",
+        "country", "latitude", "longitude", "source", "station_type",
+    ]
+    numeric_cols = [
+        c for c in data.columns
+        if c not in meta_cols + ["timestamp", "date", "raw"]
+        and pd.api.types.is_numeric_dtype(data[c])
+    ]
+
+    agg: dict[str, str] = {c: "mean" for c in numeric_cols}
+    for col in meta_cols:
+        if col in data.columns:
+            agg[col] = "first"
+
+    daily = (
+        data.groupby(["station_id", "date"], as_index=False)
+        .agg(agg)
+        .rename(columns={"date": "timestamp"})
+    )
+    return daily
+
+
+def _merge_parquet(name: str, new_df: pd.DataFrame, dedup_cols: list[str]) -> pd.DataFrame:
+    """Fusiona datos nuevos con Parquet existente sin perder histórico."""
+    path = SILVER_DIR / f"{name}.parquet"
+    if path.exists():
+        existing = pd.read_parquet(path)
+    else:
+        existing = pd.DataFrame()
+
+    if new_df.empty:
+        return existing
+
+    if existing.empty:
+        merged = new_df
+    else:
+        merged = pd.concat([existing, new_df], ignore_index=True)
+
+    dedup_subset = [c for c in dedup_cols if c in merged.columns]
+    if dedup_subset:
+        merged = merged.drop_duplicates(subset=dedup_subset, keep="last")
+
+    if "timestamp" in merged.columns:
+        merged["timestamp"] = _to_datetime(merged["timestamp"])
+        merged = merged.sort_values("timestamp")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=INGESTION_LOOKBACK_DAYS + 7)
+        merged = merged[merged["timestamp"] >= cutoff]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_parquet(path, index=False)
+    return merged
+
+
 def run_silver_transform(
     bronze_aemet: dict[str, Any], bronze_miteco: dict[str, Any]
 ) -> dict[str, pd.DataFrame]:
@@ -158,19 +221,24 @@ def run_silver_transform(
     stations = transform_stations(bronze_aemet, bronze_miteco)
 
     if not air_quality.empty:
+        air_quality = _normalize_to_daily(air_quality)
         air_quality["aqi_index"] = air_quality.apply(compute_aqi, axis=1)
 
     outputs = {
-        "silver_weather": weather,
-        "silver_air_quality": air_quality,
-        "silver_stations": stations,
+        "silver_weather": _merge_parquet(
+            "silver_weather", weather, ["station_id", "timestamp"]
+        ),
+        "silver_air_quality": _merge_parquet(
+            "silver_air_quality", air_quality, ["station_id", "timestamp"]
+        ),
+        "silver_stations": _merge_parquet(
+            "silver_stations", stations, ["station_id", "source"]
+        ),
     }
 
     for name, df in outputs.items():
         if df is not None and not df.empty:
-            path = SILVER_DIR / f"{name}.parquet"
-            df.to_parquet(path, index=False)
-            print(f"[Silver] {name}: {len(df)} registros -> {path}")
+            print(f"[Silver] {name}: {len(df)} registros -> {SILVER_DIR / f'{name}.parquet'}")
         else:
             print(f"[Silver] {name}: sin datos")
 

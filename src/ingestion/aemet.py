@@ -11,7 +11,12 @@ from typing import Any
 
 import requests
 
-from src.config import AEMET_BASE_URL, AEMET_STATIONS, API_KEY_AEMET
+from src.config import (
+    AEMET_BASE_URL,
+    AEMET_STATIONS,
+    API_KEY_AEMET,
+    INGESTION_LOOKBACK_DAYS,
+)
 
 
 class AemetClient:
@@ -126,9 +131,30 @@ def _to_float(value) -> float | None:
         return None
 
 
+def _fetch_climatology_chunks(
+    client: AemetClient,
+    idema: str,
+    start: datetime,
+    end: datetime,
+    chunk_days: int = 30,
+) -> list[dict]:
+    """Obtiene climatología diaria en bloques para respetar límites de la API."""
+    records: list[dict] = []
+    chunk_start = start
+
+    while chunk_start < end:
+        chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
+        batch = client.fetch_daily_climatology(idema, chunk_start, chunk_end)
+        records.extend(batch)
+        chunk_start = chunk_end + timedelta(days=1)
+        time.sleep(0.5)
+
+    return records
+
+
 def ingest_aemet(api_key: str | None = None) -> dict[str, Any]:
     """
-    Ejecuta ingesta AEMET completa.
+    Ejecuta ingesta AEMET completa con histórico configurable.
 
     Returns:
         dict con keys: stations_inventory, weather_records, metadata
@@ -140,6 +166,7 @@ def ingest_aemet(api_key: str | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ingested_at": datetime.now(timezone.utc).isoformat(),
         "source": "aemet",
+        "lookback_days": INGESTION_LOOKBACK_DAYS,
         "stations_inventory": [],
         "weather_records": [],
     }
@@ -152,20 +179,29 @@ def ingest_aemet(api_key: str | None = None) -> dict[str, Any]:
         print(f"[AEMET] Inventario no disponible: {exc}")
 
     end = datetime.now(timezone.utc)
-    start = end - timedelta(days=7)
+    start = end - timedelta(days=INGESTION_LOOKBACK_DAYS)
+    print(f"[AEMET] Ventana histórica: {INGESTION_LOOKBACK_DAYS} días")
 
     for station in AEMET_STATIONS:
         idema = station["idema"]
         records: list[dict] = []
+        seen: set[str] = set()
+
+        daily = _fetch_climatology_chunks(client, idema, start, end)
+        for row in daily:
+            parsed = _parse_daily(row, station)
+            key = f"{parsed['station_id']}|{parsed['timestamp']}"
+            if key not in seen:
+                seen.add(key)
+                records.append(parsed)
 
         obs = client.fetch_station_observation(idema)
         for row in obs:
-            records.append(_parse_observation(row, station))
-
-        if not records:
-            daily = client.fetch_daily_climatology(idema, start, end)
-            for row in daily:
-                records.append(_parse_daily(row, station))
+            parsed = _parse_observation(row, station)
+            key = f"{parsed['station_id']}|{parsed['timestamp']}"
+            if key not in seen:
+                seen.add(key)
+                records.append(parsed)
 
         payload["weather_records"].extend(records)
         print(f"[AEMET] {station['name']}: {len(records)} registros")

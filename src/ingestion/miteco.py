@@ -10,10 +10,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
-import pandas as pd
 import requests
 
-from src.config import URL_BUSQUEDA_MITECO, URL_DATASTORE_MITECO
+from src.config import INGESTION_LOOKBACK_DAYS, URL_BUSQUEDA_MITECO, URL_DATASTORE_MITECO
 
 
 MITECO_STATIONS = [
@@ -108,10 +107,11 @@ def _fetch_miteco_portal() -> list[dict]:
     return []
 
 
-def _generate_fallback_measurements(hours: int = 48) -> list[dict]:
-    """Genera mediciones horarias estructuradas para estaciones MITECO."""
-    np.random.seed(int(datetime.now().timestamp()) % 10000)
-    now = datetime.now(timezone.utc)
+def _generate_fallback_measurements(days: int | None = None) -> list[dict]:
+    """Genera mediciones diarias estructuradas para estaciones MITECO."""
+    lookback = days or INGESTION_LOOKBACK_DAYS
+    np.random.seed(42)
+    now = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
     records = []
 
     pollutant_ranges = {
@@ -125,20 +125,23 @@ def _generate_fallback_measurements(hours: int = 48) -> list[dict]:
 
     for station in MITECO_STATIONS:
         base_factor = 0.8 + (hash(station["station_id"]) % 40) / 100
-        for h in range(hours):
-            ts = now - timedelta(hours=h)
+        for d in range(lookback):
+            ts = now - timedelta(days=d)
+            seasonal = 1.0 + 0.15 * np.sin(2 * np.pi * ts.timetuple().tm_yday / 365)
+            weekly = 1.0 + 0.08 * np.sin(2 * np.pi * ts.weekday() / 7)
+            noise = np.random.uniform(0.85, 1.15)
+
             row = {
                 **station,
                 "timestamp": ts.isoformat(),
                 "source": "miteco",
             }
             for pollutant, (lo, hi) in pollutant_ranges.items():
-                row[pollutant] = round(
-                    np.random.uniform(lo, hi) * base_factor, 2
-                )
+                base = np.random.uniform(lo, hi) * base_factor * seasonal * weekly * noise
+                row[pollutant] = round(max(0, base), 2)
             records.append(row)
 
-    print(f"[MITECO] Fallback: {len(records)} registros generados")
+    print(f"[MITECO] Fallback: {len(records)} registros diarios ({lookback} días)")
     return records
 
 
@@ -152,6 +155,7 @@ def ingest_miteco() -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ingested_at": datetime.now(timezone.utc).isoformat(),
         "source": "miteco",
+        "lookback_days": INGESTION_LOOKBACK_DAYS,
         "catalog_metadata": [],
         "stations": MITECO_STATIONS,
         "air_quality_records": [],
@@ -160,7 +164,7 @@ def ingest_miteco() -> dict[str, Any]:
     payload["catalog_metadata"] = _fetch_datos_gob_catalog()
     payload["portal_metadata"] = _fetch_miteco_portal()
 
-    records = _generate_fallback_measurements(hours=48)
+    records = _generate_fallback_measurements()
 
     for station in MITECO_STATIONS:
         station_records = [r for r in records if r["station_id"] == station["station_id"]]

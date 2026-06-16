@@ -1,31 +1,24 @@
 """
-Dashboard Streamlit - Plataforma Inteligente de Monitoreo Ambiental
-Arquitectura Medallion | Modelo Estrella | AEMET + MITECO
+Dashboard Streamlit - Home ejecutivo
+Plataforma Inteligente de Monitoreo Ambiental
 """
 
-import json
-import sys
+import runpy
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+runpy.run_path(str(Path(__file__).resolve().parent / "bootstrap.py"))
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 from streamlit_folium import st_folium
 
-from src.config import REPORTS_DIR, WHO_LIMITS
-from src.gold.loader import query_facts, query_kpis
-from src.ml.predict import load_training_data, train_and_predict
-from src.utils.maps import (
-    build_station_summary,
-    create_alerts_map,
-    create_heatmap,
-    create_station_map,
-    load_latest_alerts,
-)
+from src.dashboard.components.filters import render_sidebar_filters
+from src.dashboard.components.kpi_cards import render_kpi_row
+from src.dashboard.components.status_bar import render_status_bar
+from src.dashboard.components.styles import inject_styles
+from src.dashboard.services.data import load_filtered_facts, load_filtered_kpis
+from src.utils.maps import build_station_summary, create_station_map, load_latest_alerts
 
 
 st.set_page_config(
@@ -34,219 +27,57 @@ st.set_page_config(
     layout="wide",
 )
 
-st.markdown(
-    """
-<style>
-.main-title { font-size: 2rem; font-weight: 700; }
-.kpi-box { background: #f0f2f6; border-radius: 10px; padding: 16px; text-align: center; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
+inject_styles()
+render_sidebar_filters()
 
+df = load_filtered_facts()
+kpis = load_filtered_kpis()
 
-@st.cache_data(ttl=300)
-def load_facts():
-    return query_facts(limit=5000)
+st.markdown("<div class='main-title'>Visión ejecutiva</div>", unsafe_allow_html=True)
+render_status_bar()
 
+if kpis.get("error"):
+    st.error(f"Error cargando KPIs: {kpis['error']}")
+else:
+    render_kpi_row(kpis)
 
-@st.cache_data(ttl=300)
-def load_kpis():
-    return query_kpis()
+st.markdown("---")
+left, right = st.columns(2)
 
-
-def show_overview(kpis: dict, df: pd.DataFrame):
-    st.markdown("<div class='main-title'>📊 Visión General - KPIs</div>", unsafe_allow_html=True)
-    st.markdown("---")
-
-    cols = st.columns(6)
-    metrics = [
-        ("Temp. media", kpis.get("avg_temperature"), "°C"),
-        ("Humedad", kpis.get("avg_humidity"), "%"),
-        ("PM10", kpis.get("avg_pm10"), "µg/m³"),
-        ("PM2.5", kpis.get("avg_pm25"), "µg/m³"),
-        ("NO2", kpis.get("avg_no2"), "µg/m³"),
-        ("AQI", kpis.get("avg_aqi"), ""),
-    ]
-    for col, (label, val, unit) in zip(cols, metrics):
-        with col:
-            display = f"{val:.1f}{unit}" if val is not None else "N/A"
-            st.markdown(
-                f"<div class='kpi-box'><h4>{label}</h4><h2>{display}</h2></div>",
-                unsafe_allow_html=True,
-            )
-
-    if not df.empty and "station_type" in df.columns:
-        st.subheader("Registros por tipo de estación")
-        fig = px.pie(df, names="station_type", title="Distribución de fuentes")
+with left:
+    st.subheader("Distribución AQI")
+    dist = kpis.get("aqi_distribution", {})
+    if any(dist.values()):
+        dist_df = pd.DataFrame(
+            {"categoria": list(dist.keys()), "registros": list(dist.values())}
+        )
+        fig = px.bar(
+            dist_df,
+            x="categoria",
+            y="registros",
+            color="categoria",
+            title="Registros por categoría AQI",
+        )
         st.plotly_chart(fig, use_container_width=True)
-
-    critical = kpis.get("critical_stations", [])
-    if critical:
-        st.subheader("⚠️ Estaciones críticas (AQI > 50)")
-        st.dataframe(pd.DataFrame(critical), use_container_width=True)
-
-
-def show_maps(df: pd.DataFrame):
-    st.markdown("<div class='main-title'>🗺️ Mapas Folium</div>", unsafe_allow_html=True)
-    st.markdown("---")
-
-    if df.empty:
-        st.warning("Sin datos. Ejecuta el pipeline ETL primero.")
-        return
-
-    summary = build_station_summary(df)
-    layer = st.selectbox(
-        "Capa",
-        ["Estaciones", "Heatmap AQI", "Heatmap NO2", "Alertas geográficas"],
-    )
-
-    if layer == "Estaciones":
-        st_folium(create_station_map(summary), width=1000, height=550)
-    elif layer.startswith("Heatmap"):
-        col = "aqi_index" if "AQI" in layer else "no2"
-        st_folium(create_heatmap(summary, value_col=col), width=1000, height=550)
     else:
-        alerts = load_latest_alerts()
-        if alerts:
-            st_folium(create_alerts_map(alerts), width=1000, height=550)
-        else:
-            st.info("No hay alertas activas.")
+        st.info("Sin datos de AQI en la ventana seleccionada.")
 
-
-def show_trends(df: pd.DataFrame):
-    st.markdown("<div class='main-title'>📈 Tendencias</div>", unsafe_allow_html=True)
-    st.markdown("---")
-
-    if df.empty:
-        st.warning("Sin datos.")
-        return
-
-    df = df.copy()
-    df["measured_at"] = pd.to_datetime(df["measured_at"], utc=True)
-    pollutant = st.selectbox(
-        "Indicador",
-        [c for c in ["pm25", "pm10", "no2", "temperature", "humidity", "aqi_index"] if c in df.columns],
-    )
-
-    daily = (
-        df.groupby(df["measured_at"].dt.date)[pollutant]
-        .mean()
-        .reset_index()
-    )
-    daily.columns = ["fecha", pollutant]
-
-    fig = px.line(daily, x="fecha", y=pollutant, markers=True, title=f"Tendencia diaria - {pollutant}")
-    st.plotly_chart(fig, use_container_width=True)
-
-    if "region" in df.columns:
-        regional = df.groupby("region")[pollutant].mean().sort_values(ascending=False)
-        fig2 = px.bar(regional, title=f"{pollutant} promedio por región")
-        st.plotly_chart(fig2, use_container_width=True)
-
-
-def show_ml():
-    st.markdown("<div class='main-title'>🤖 Predicciones ML</div>", unsafe_allow_html=True)
-    st.markdown("---")
-    st.info("Random Forest - Horizontes: 24 h, 48 h, 7 días")
-
-    df = load_training_data()
-    if df.empty or len(df) < 50:
-        st.warning("Datos insuficientes. Ejecuta el pipeline completo.")
-        return
-
-    with st.spinner("Entrenando modelo..."):
-        result = train_and_predict(df)
-
-    if not result:
-        st.warning("No se pudo entrenar el modelo.")
-        return
-
-    m = result["metrics"]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("MAE", f"{m['mae']:.2f}")
-    c2.metric("RMSE", f"{m['rmse']:.2f}")
-    c3.metric("R²", f"{m['r2']:.3f}")
-
-    forecast_df = pd.DataFrame(result["forecasts"].values())
-    fig = px.bar(
-        forecast_df,
-        x="hours",
-        y="predicted_value",
-        title=f"Pronóstico {m['target']} (µg/m³)",
-        labels={"hours": "Horas", "predicted_value": m["target"]},
-    )
-    st.plotly_chart(fig, use_container_width=True)
-    st.dataframe(forecast_df, use_container_width=True)
-
-
-def show_alerts():
-    st.markdown("<div class='main-title'>🚨 Sistema de Alertas (OMS)</div>", unsafe_allow_html=True)
-    st.markdown("---")
-
-    st.write("Límites OMS aplicados:", WHO_LIMITS)
+with right:
+    st.subheader("Alertas críticas recientes")
     alerts = load_latest_alerts()
+    critical = [a for a in alerts if a.get("severity") == "critical"][:5]
+    if critical:
+        st.dataframe(pd.DataFrame(critical), use_container_width=True, hide_index=True)
+        st.page_link("pages/5_Alertas.py", label="Ver todas las alertas", icon="🚨")
+    else:
+        st.success("No hay alertas críticas activas.")
 
-    if not alerts:
-        st.success("No hay alertas activas.")
-        return
-
-    alert_df = pd.DataFrame(alerts)
-    st.dataframe(alert_df, use_container_width=True)
-
-    critical = [a for a in alerts if a.get("severity") == "critical"]
-    st.metric("Alertas críticas", len(critical))
-    st.metric("Total alertas", len(alerts))
-
-
-def show_llm():
-    st.markdown("<div class='main-title'>📄 Resúmenes IA</div>", unsafe_allow_html=True)
-    st.markdown("---")
-
-    reports = sorted(REPORTS_DIR.glob("resumen_ambiental_*.md"))
-    if not reports:
-        st.info("Ejecuta: `python src/llm/summaries.py` o el pipeline completo.")
-        return
-
-    selected = st.selectbox("Reporte", reports, format_func=lambda p: p.stem)
-    st.markdown(selected.read_text(encoding="utf-8"), unsafe_allow_html=False)
-
-
-def main():
-    st.sidebar.markdown("## 🌍 Monitoreo Ambiental")
-    st.sidebar.caption("Medallion | Estrella | AEMET + MITECO")
-
-    page = st.sidebar.radio(
-        "Navegación",
-        [
-            "📊 KPIs",
-            "🗺️ Mapas",
-            "📈 Tendencias",
-            "🤖 ML",
-            "🚨 Alertas",
-            "📄 Resúmenes IA",
-        ],
-    )
-
-    df = load_facts()
-    kpis = load_kpis()
-
-    st.sidebar.markdown("---")
-    st.sidebar.write(f"Registros DW: {len(df):,}")
-
-    if page == "📊 KPIs":
-        show_overview(kpis, df)
-    elif page == "🗺️ Mapas":
-        show_maps(df)
-    elif page == "📈 Tendencias":
-        show_trends(df)
-    elif page == "🤖 ML":
-        show_ml()
-    elif page == "🚨 Alertas":
-        show_alerts()
-    elif page == "📄 Resúmenes IA":
-        show_llm()
-
-
-if __name__ == "__main__":
-    main()
+st.subheader("Mapa resumen de estaciones")
+if df.empty:
+    st.warning("Sin datos en la ventana seleccionada. Ejecuta el pipeline ETL primero.")
+else:
+    summary = build_station_summary(df)
+    if summary.empty:
+        st.info("No hay estaciones con coordenadas en el filtro actual.")
+    else:
+        st_folium(create_station_map(summary), height=420, use_container_width=True)

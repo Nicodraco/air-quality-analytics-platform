@@ -41,6 +41,10 @@ POSTGRES_DB = _env("POSTGRES_DB", "ambiental_dw")
 POSTGRES_USER = _env("POSTGRES_USER", "ambiental")
 POSTGRES_PASSWORD = _env("POSTGRES_PASSWORD", "ambiental123")
 
+INGESTION_LOOKBACK_DAYS = int(_env("INGESTION_LOOKBACK_DAYS", "90"))
+FORECAST_DAYS = int(_env("FORECAST_DAYS", "7"))
+ML_MIN_TRAINING_DAYS = int(_env("ML_MIN_TRAINING_DAYS", "21"))
+
 # --- LLM ---
 LLM_PROVIDER = _env("LLM_PROVIDER", "narrativo")  # ollama | openai | narrativo
 LLM_API_KEY = _env("LLM_API_KEY")
